@@ -1,0 +1,863 @@
+// VLedger AI — PostgreSQL schema
+// Every workspace-owned financial table carries `workspaceId`. Integrity rules that
+// Prisma cannot express (balanced journals, append-only audit history, immutable
+// ledger lines) are enforced with triggers in prisma/migrations/*_integrity.
+
+generator client {
+  provider = "prisma-client-js"
+  // Load included relations with SQL joins (one round trip) instead of one query per relation.
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum PlatformRole {
+  SUPER_ADMIN
+  USER
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+}
+
+enum WorkspaceStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  DISABLED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum AuthTokenType {
+  PASSWORD_RESET
+  EMAIL_VERIFY
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+enum CategoryKind {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+  JOURNAL
+}
+
+enum TransactionStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  POSTED
+  REVERSED
+  REJECTED
+}
+
+enum EntrySource {
+  VOICE
+  TEXT
+  MANUAL
+  IMPORT
+}
+
+enum JournalEntryType {
+  STANDARD
+  OPENING
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+}
+
+enum JobStatus {
+  PREVIEW
+  COMPLETED
+  FAILED
+}
+
+enum NotificationStatus {
+  SENT
+  FAILED
+  DEV_LOGGED
+}
+
+enum BillAllocationType {
+  NEW_REF
+  AGST_REF
+  ADVANCE
+  ON_ACCOUNT
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id               String       @id @default(cuid())
+  seq              Int          @unique @default(autoincrement())
+  email            String       @unique
+  name             String
+  passwordHash     String?
+  platformRole     PlatformRole @default(USER)
+  status           UserStatus   @default(PENDING)
+  emailVerifiedAt  DateTime?
+  failedLoginCount Int          @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+  lastLoginIp      String?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  memberships   WorkspaceMembership[]
+  sessions      Session[]
+  mfaCredential MfaCredential?
+  recoveryCodes RecoveryCode[]
+  authTokens    AuthToken[]
+
+  createdTransactions  Transaction[] @relation("TxnCreatedBy")
+  updatedTransactions  Transaction[] @relation("TxnUpdatedBy")
+  approvedTransactions Transaction[] @relation("TxnApprovedBy")
+  postedTransactions   Transaction[] @relation("TxnPostedBy")
+  reversedTransactions Transaction[] @relation("TxnReversedBy")
+
+  @@map("users")
+}
+
+model Session {
+  id                String    @id @default(cuid())
+  tokenHash         String    @unique
+  userId            String
+  mfaVerified       Boolean   @default(false)
+  activeWorkspaceId String?
+  ip                String?
+  userAgent         String?
+  createdAt         DateTime  @default(now())
+  lastSeenAt        DateTime  @default(now())
+  expiresAt         DateTime
+  revokedAt         DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model MfaCredential {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  secretEncrypted String
+  enabledAt       DateTime?
+  lastUsedStep    Int?
+  createdAt       DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_credentials")
+}
+
+model RecoveryCode {
+  id        String    @id @default(cuid())
+  userId    String
+  codeHash  String
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("recovery_codes")
+}
+
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+model RateLimit {
+  key         String   @id
+  count       Int
+  windowStart DateTime
+
+  @@map("rate_limits")
+}
+
+// ───────────────────────────── Workspaces ─────────────────────────────
+
+model Workspace {
+  id               String          @id @default(cuid())
+  seq              Int             @unique @default(autoincrement())
+  code             String          @unique
+  name             String
+  companyName      String
+  companyEmail     String
+  country          String
+  defaultCurrency  String          @db.VarChar(3)
+  fyStartMonth     Int             @default(4)
+  timeZone         String
+  status           WorkspaceStatus @default(ACTIVE)
+  createdById      String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  suspendedAt      DateTime?
+  archivedAt       DateTime?
+
+  settings     WorkspaceSettings?
+  memberships  WorkspaceMembership[]
+  invitations  WorkspaceInvitation[]
+  roles        Role[]
+  accounts     Account[]
+  accountGroups AccountGroup[]
+  categories   AccountCategory[]
+  customers    Customer[]
+  vendors      Vendor[]
+  transactions Transaction[]
+  journals     JournalEntry[]
+  journalLines JournalLine[]
+  approvals    Approval[]
+  importJobs   ImportJob[]
+  exportJobs   ExportJob[]
+  mappings     IntegrationAccountMapping[]
+  reconciliations Reconciliation[]
+  billAllocations BillAllocation[]
+  auditEvents  AuditEvent[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceSettings {
+  id                     String   @id @default(cuid())
+  workspaceId            String   @unique
+  autoPostEnabled        Boolean  @default(false)
+  autoPostMinConfidence  Float    @default(0.9)
+  requireApproval        Boolean  @default(false)
+  approvalThreshold      Decimal? @db.Decimal(18, 2)
+  duplicateWindowDays    Int      @default(3)
+  mfaRequiredForUsers    Boolean  @default(false)
+  dailySummaryEmail      Boolean  @default(false)
+  monthlySummaryEmail    Boolean  @default(false)
+  nextTransactionNumber  Int      @default(1)
+  nextJournalNumber      Int      @default(1)
+  integrationConfig      Json     @default("{}")
+  updatedAt              DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@map("workspace_settings")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  isAdmin     Boolean  @default(false)
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  workspace   Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  memberships WorkspaceMembership[]
+  invitations WorkspaceInvitation[]
+
+  @@unique([workspaceId, name])
+  @@map("roles")
+}
+
+model Permission {
+  id          String @id @default(cuid())
+  key         String @unique
+  label       String
+  description String
+
+  roles       RolePermission[]
+  memberships MembershipPermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model WorkspaceMembership {
+  id          String           @id @default(cuid())
+  workspaceId String
+  userId      String
+  roleId      String
+  status      MembershipStatus @default(INVITED)
+  employeeId  String?
+  department  String?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  workspace   Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User                   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role        Role                   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  permissions MembershipPermission[]
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_memberships")
+}
+
+/// Extra permissions granted to an individual member on top of their role.
+model MembershipPermission {
+  membershipId String
+  permissionId String
+
+  membership WorkspaceMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  permission Permission          @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([membershipId, permissionId])
+  @@map("membership_permissions")
+}
+
+model WorkspaceInvitation {
+  id             String           @id @default(cuid())
+  workspaceId    String
+  email          String
+  name           String
+  roleId         String
+  employeeId     String?
+  department     String?
+  permissionKeys String[]         @default([])
+  tokenHash      String           @unique
+  status         InvitationStatus @default(PENDING)
+  expiresAt      DateTime
+  invitedById    String?
+  invitedByName  String
+  acceptedAt     DateTime?
+  acceptedUserId String?
+  createdAt      DateTime         @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  role      Role      @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId, email])
+  @@map("workspace_invitations")
+}
+
+// ───────────────────────────── Chart of accounts ─────────────────────────────
+
+model AccountGroup {
+  id                 String       @id @default(cuid())
+  workspaceId        String
+  name               String
+  code               String?
+  parentGroupId      String?
+  nature             AccountType
+  isPrimary          Boolean      @default(false)
+  affectsGrossProfit Boolean      @default(false)
+  sortOrder          Int          @default(0)
+  createdAt          DateTime     @default(now())
+
+  workspace   Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  parentGroup AccountGroup?   @relation("GroupHierarchy", fields: [parentGroupId], references: [id], onDelete: Restrict)
+  childGroups AccountGroup[]  @relation("GroupHierarchy")
+  accounts    Account[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId, parentGroupId])
+  @@map("account_groups")
+}
+
+model Account {
+  id                 String      @id @default(cuid())
+  workspaceId        String
+  code               String
+  name               String
+  type               AccountType
+  /// BANK, CASH, RECEIVABLE, PAYABLE, TAX, OPENING_EQUITY, RETAINED_EARNINGS, ...
+  subtype            String?
+  description        String?
+  bankName           String?
+  accountNumberLast4 String?
+  isActive           Boolean     @default(true)
+  isSystem           Boolean     @default(false)
+  openingBalance     Decimal     @default(0) @db.Decimal(18, 2)
+  openingBalanceDate DateTime?   @db.Date
+  groupId            String?
+  partyType          String?
+  gstin              String?
+  pan                String?
+  state              String?
+  address            String?
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  workspace       Workspace                   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  group           AccountGroup?               @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  categories      AccountCategory[]
+  journalLines    JournalLine[]
+  debitTxns       Transaction[]               @relation("TxnDebitAccount")
+  creditTxns      Transaction[]               @relation("TxnCreditAccount")
+  partyTxns       Transaction[]               @relation("TxnPartyAccount")
+  billAllocations BillAllocation[]
+  mappings        IntegrationAccountMapping[]
+  reconciliations Reconciliation[]
+
+  @@unique([workspaceId, code])
+  @@unique([workspaceId, name])
+  @@index([workspaceId, type])
+  @@index([workspaceId, groupId])
+  @@map("accounts")
+}
+
+/// Business-facing categories ("Electricity Expense") that resolve to a ledger account.
+model AccountCategory {
+  id          String       @id @default(cuid())
+  workspaceId String
+  name        String
+  kind        CategoryKind
+  accountId   String
+  keywords    String[]     @default([])
+  isActive    Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  transactions Transaction[]
+
+  @@unique([workspaceId, name])
+  @@map("account_categories")
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  email       String?
+  phone       String?
+  taxId       String?
+  createdAt   DateTime @default(now())
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@unique([workspaceId, name])
+  @@map("customers")
+}
+
+model Vendor {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  email       String?
+  phone       String?
+  taxId       String?
+  createdAt   DateTime @default(now())
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@unique([workspaceId, name])
+  @@map("vendors")
+}
+
+// ───────────────────────────── Transactions & ledger ─────────────────────────────
+
+model Transaction {
+  id              String            @id @default(cuid())
+  workspaceId     String
+  number          Int
+  date            DateTime          @db.Date
+  type            TransactionType
+  amount          Decimal           @db.Decimal(18, 2)
+  currency        String            @db.VarChar(3)
+  exchangeRate    Decimal           @default(1) @db.Decimal(18, 6)
+  description     String
+  categoryId      String?
+  debitAccountId  String?
+  creditAccountId String?
+  /// Multi-line proposal for JOURNAL drafts: [{accountId, debit, credit, description}]
+  draftLines      Json?
+  /// JOURNAL transactions flagged as period adjustments post as ADJUSTMENT entries.
+  isAdjustment    Boolean           @default(false)
+  paymentMethod   String?
+  reference       String?
+  notes           String?
+  status          TransactionStatus @default(DRAFT)
+  source          EntrySource
+  aiConfidence    Float?
+  rawInput        String?
+  customerId      String?
+  vendorId        String?
+  duplicateHash   String?
+
+  // Attribution — always taken from the authenticated server session.
+  createdById     String
+  createdByName   String
+  createdAt       DateTime          @default(now())
+  updatedById     String?
+  updatedByName   String?
+  updatedAt       DateTime          @updatedAt
+  approvedById    String?
+  approvedAt      DateTime?
+  postedById      String?
+  postedAt        DateTime?
+  reversedById    String?
+  reversedAt      DateTime?
+  reversalReason  String?
+
+  // Import provenance — external identities are recorded but never trusted as internal users.
+  importJobId         String?
+  externalRef         String?
+  externalCreatorId   String?
+  externalCreatorName String?
+
+  // Tally & GST fields
+  voucherType         String?           // SALES, PURCHASE, PAYMENT, RECEIPT, CONTRA, JOURNAL, CREDIT_NOTE, DEBIT_NOTE
+  invoiceNumber       String?
+  invoiceDate         DateTime?         @db.Date
+  partyLedgerId       String?
+  taxableAmount       Decimal?          @db.Decimal(18, 2)
+  cgstAmount          Decimal?          @db.Decimal(18, 2)
+  sgstAmount          Decimal?          @db.Decimal(18, 2)
+  igstAmount          Decimal?          @db.Decimal(18, 2)
+  gstRate             Decimal?          @db.Decimal(5, 2)
+  hsnCode             String?
+
+  journalEntryId  String?           @unique
+  reversalEntryId String?           @unique
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  category        AccountCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  debitAccount    Account?         @relation("TxnDebitAccount", fields: [debitAccountId], references: [id], onDelete: Restrict)
+  creditAccount   Account?         @relation("TxnCreditAccount", fields: [creditAccountId], references: [id], onDelete: Restrict)
+  partyLedger     Account?         @relation("TxnPartyAccount", fields: [partyLedgerId], references: [id], onDelete: SetNull)
+  customer        Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  vendor          Vendor?          @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  createdBy       User             @relation("TxnCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  updatedBy       User?            @relation("TxnUpdatedBy", fields: [updatedById], references: [id], onDelete: Restrict)
+  approvedBy      User?            @relation("TxnApprovedBy", fields: [approvedById], references: [id], onDelete: Restrict)
+  postedBy        User?            @relation("TxnPostedBy", fields: [postedById], references: [id], onDelete: Restrict)
+  reversedBy      User?            @relation("TxnReversedBy", fields: [reversedById], references: [id], onDelete: Restrict)
+  journalEntry    JournalEntry?    @relation("TxnJournal", fields: [journalEntryId], references: [id], onDelete: Restrict)
+  reversalEntry   JournalEntry?    @relation("TxnReversalJournal", fields: [reversalEntryId], references: [id], onDelete: Restrict)
+  importJob       ImportJob?       @relation(fields: [importJobId], references: [id], onDelete: SetNull)
+  approvals       Approval[]
+  exportItems     ExportJobItem[]
+  billAllocations BillAllocation[]
+
+  @@unique([workspaceId, number])
+  @@index([workspaceId, date])
+  @@index([workspaceId, createdById])
+  @@index([workspaceId, status])
+  @@index([workspaceId, duplicateHash])
+  @@map("transactions")
+}
+
+model JournalEntry {
+  id              String           @id @default(cuid())
+  workspaceId     String
+  number          Int
+  date            DateTime         @db.Date
+  type            JournalEntryType @default(STANDARD)
+  description     String
+  reference       String?
+  reversesEntryId String?          @unique
+  totalDebit      Decimal          @db.Decimal(18, 2)
+  totalCredit     Decimal          @db.Decimal(18, 2)
+  postedById      String
+  postedByName    String
+  postedAt        DateTime         @default(now())
+
+  workspace       Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  lines           JournalLine[]
+  reverses        JournalEntry? @relation("JournalReversal", fields: [reversesEntryId], references: [id], onDelete: Restrict)
+  reversedBy      JournalEntry? @relation("JournalReversal")
+  transaction     Transaction?  @relation("TxnJournal")
+  reversalOfTxn   Transaction?  @relation("TxnReversalJournal")
+
+  @@unique([workspaceId, number])
+  @@index([workspaceId, date])
+  @@map("journal_entries")
+}
+
+model JournalLine {
+  id               String    @id @default(cuid())
+  journalEntryId   String
+  workspaceId      String
+  accountId        String
+  lineNo           Int
+  debit            Decimal   @default(0) @db.Decimal(18, 2)
+  credit           Decimal   @default(0) @db.Decimal(18, 2)
+  description      String?
+  reconciledAt     DateTime?
+  reconciliationId String?
+
+  journalEntry   JournalEntry    @relation(fields: [journalEntryId], references: [id], onDelete: Restrict)
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  account        Account         @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  reconciliation Reconciliation? @relation(fields: [reconciliationId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, accountId])
+  @@index([journalEntryId])
+  @@map("journal_lines")
+}
+
+model Approval {
+  id            String           @id @default(cuid())
+  workspaceId   String
+  transactionId String
+  decision      ApprovalDecision
+  comment       String?
+  decidedById   String
+  decidedByName String
+  createdAt     DateTime         @default(now())
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId, transactionId])
+  @@map("approvals")
+}
+
+model Reconciliation {
+  id               String   @id @default(cuid())
+  workspaceId      String
+  accountId        String
+  statementDate    DateTime @db.Date
+  statementBalance Decimal  @db.Decimal(18, 2)
+  bookBalance      Decimal  @db.Decimal(18, 2)
+  difference       Decimal  @db.Decimal(18, 2)
+  completedById    String
+  completedByName  String
+  createdAt        DateTime @default(now())
+
+  workspace Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  account   Account       @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  lines     JournalLine[]
+
+  @@index([workspaceId, accountId])
+  @@map("reconciliations")
+}
+
+model BillAllocation {
+  id             String             @id @default(cuid())
+  workspaceId    String
+  transactionId  String
+  accountId      String
+  type           BillAllocationType @default(NEW_REF)
+  refNo          String
+  dueDate        DateTime?          @db.Date
+  amount         Decimal            @db.Decimal(18, 2)
+  pendingAmount  Decimal            @db.Decimal(18, 2)
+  isSettled      Boolean            @default(false)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  workspace      Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  transaction    Transaction        @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  account        Account            @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId, accountId, isSettled])
+  @@index([workspaceId, refNo])
+  @@map("bill_allocations")
+}
+
+// ───────────────────────────── Audit ─────────────────────────────
+
+/// Append-only. UPDATE and DELETE are rejected by a database trigger.
+model AuditEvent {
+  id            String   @id @default(cuid())
+  workspaceId   String?
+  actorUserId   String?
+  actorName     String
+  actorEmail    String?
+  entityType    String
+  entityId      String?
+  transactionId String?
+  action        String
+  reason        String?
+  before        Json?
+  after         Json?
+  approvalId    String?
+  reversalId    String?
+  ip            String?
+  userAgent     String?
+  createdAt     DateTime @default(now())
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId, createdAt])
+  @@index([transactionId])
+  @@index([actorUserId])
+  @@map("audit_events")
+}
+
+// ───────────────────────────── Import / export ─────────────────────────────
+
+model ImportJob {
+  id             String    @id @default(cuid())
+  workspaceId    String
+  fileName       String
+  status         JobStatus @default(PREVIEW)
+  importedById   String
+  importedByName String
+  totalRecords   Int       @default(0)
+  importedCount  Int       @default(0)
+  duplicateCount Int       @default(0)
+  errorCount     Int       @default(0)
+  errors         Json      @default("[]")
+  preview        Json?
+  createdAt      DateTime  @default(now())
+  completedAt    DateTime?
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  transactions Transaction[]
+
+  @@index([workspaceId, createdAt])
+  @@map("import_jobs")
+}
+
+model ExportJob {
+  id              String    @id @default(cuid())
+  workspaceId     String
+  adapterKey      String
+  format          String
+  filters         Json
+  status          JobStatus @default(COMPLETED)
+  recordCount     Int       @default(0)
+  fileName        String
+  contentType     String
+  content         String
+  auditFileName   String?
+  auditContent    String?
+  checksum        String
+  warnings        Json      @default("[]")
+  createdById     String
+  createdByName   String
+  createdAt       DateTime  @default(now())
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  items     ExportJobItem[]
+
+  @@index([workspaceId, createdAt])
+  @@map("export_jobs")
+}
+
+model ExportJobItem {
+  id            String   @id @default(cuid())
+  exportJobId   String
+  transactionId String
+  workspaceId   String
+  adapterKey    String
+  createdAt     DateTime @default(now())
+
+  exportJob   ExportJob   @relation(fields: [exportJobId], references: [id], onDelete: Cascade)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId, adapterKey, transactionId])
+  @@map("export_job_items")
+}
+
+/// Platform-level availability of each adapter (adapter specs live in code).
+model IntegrationAdapter {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  enabled   Boolean  @default(true)
+  config    Json     @default("{}")
+  updatedAt DateTime @updatedAt
+
+  @@map("integration_adapters")
+}
+
+model IntegrationAccountMapping {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  adapterKey   String
+  accountId    String
+  externalCode String
+  externalName String?
+  updatedAt    DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, adapterKey, accountId])
+  @@map("integration_account_mappings")
+}
+
+// ───────────────────────────── Platform ─────────────────────────────
+
+model PlatformSettings {
+  id                   String   @id @default("platform")
+  platformName         String   @default("VLedger AI")
+  defaultCountry       String   @default("India")
+  defaultCurrency      String   @default("INR")
+  defaultTimeZone      String   @default("Asia/Kolkata")
+  defaultFyStartMonth  Int      @default(4)
+  requireMfaForUsers   Boolean  @default(false)
+  sessionTtlHours      Int      @default(12)
+  invitationTtlHours   Int      @default(72)
+  allowSelfPasswordReset Boolean @default(true)
+  updatedAt            DateTime @updatedAt
+
+  @@map("platform_settings")
+}
+
+model NotificationLog {
+  id                String             @id @default(cuid())
+  workspaceId       String?
+  userId            String?
+  toEmail           String
+  template          String
+  subject           String
+  status            NotificationStatus
+  providerMessageId String?
+  error             String?
+  /// Populated only when EMAIL_DEV_OUTBOX=true and Brevo is not configured.
+  devBody           String?
+  createdAt         DateTime           @default(now())
+
+  @@index([createdAt])
+  @@map("notification_logs")
+}
