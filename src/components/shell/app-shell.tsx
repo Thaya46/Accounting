@@ -99,6 +99,9 @@ function SidebarNav({ sections, collapsed, onNavigate }: { sections: NavSection[
                 <li key={item.href}>
                   <Link
                     href={item.href}
+                    // No viewport prefetch: a sidebar of ~15 links would fire ~15 server
+                    // requests (each checking the session in the database) per page view.
+                    prefetch={false}
                     onClick={onNavigate}
                     title={collapsed ? item.label : undefined}
                     aria-current={active ? "page" : undefined}

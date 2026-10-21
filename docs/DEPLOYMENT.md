@@ -58,7 +58,7 @@ npm start                        # listens on port 3000 (set PORT or put a proxy
 
 1. In Vercel choose **Add New → Project**, import the GitHub repository, and keep the detected Next.js settings. The build command `npm run build` runs `prisma generate` first.
 2. Under **Settings → Environment Variables**, add the variables from the table above for Production (and Preview if used):
-   * `DATABASE_URL` — on serverless, lower the pool per instance, e.g. `connection_limit=5`, and keep `max_idle_connection_lifetime`. Set `DIRECT_DATABASE_URL` too.
+   * `DATABASE_URL` and `DIRECT_DATABASE_URL`. On Vercel each running copy of the app is limited to 2 connections whatever the URL's `connection_limit` says (`src/lib/db.ts`). Set `DATABASE_POOL_SIZE` to change that. Poolers such as PgBouncer cap the total number of client connections (`FATAL: no more connections allowed (max_client_conn)`), and every copy plus every local server pointed at the same database counts towards it. Give local servers a small `DATABASE_POOL_SIZE` too.
    * `APP_ENCRYPTION_KEY` — the **same** value the database was set up with, or enrolled authenticator apps stop working.
    * `BREVO_*`, `EMAIL_DEV_OUTBOX=false`, `AI_*` as needed. Add `CRON_SECRET`, a long random string, to enable the scheduled summaries.
    * `APP_URL` is optional. Without it, email links use the project's production domain (`VERCEL_PROJECT_PRODUCTION_URL`). Set it when you use a custom domain.
